@@ -1,0 +1,9 @@
+backend: mock
+teacher_model_id: "opd/mock-teacher-v1"
+student_model_id: "opd/mock-student-v1"
+latent_dim: 32
+text_embed_dim: 32
+num_inference_steps: 16
+scheduler_step_size: 0.1
+guidance_scale: 1.0
+dtype: float32

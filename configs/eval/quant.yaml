@@ -1,0 +1,6 @@
+heldout_categories:
+  - travel
+  - tech
+num_eval_prompts: 12
+compute_clip_metrics: false
+export_num_pairs: 24

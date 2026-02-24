@@ -1,0 +1,6 @@
+num_inference_steps: 16
+initial_noise_scale: 1.0
+kl_weight: 1.0
+epsilon_mse_weight: 0.2
+latent_mse_weight: 0.1
+warmup_steps: 10

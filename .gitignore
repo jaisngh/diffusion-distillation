@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local environment files
+.env
+.DS_Store
+
+# Experiment and model artifacts
+outputs/checkpoints/
+outputs/metrics/
+outputs/images/
+outputs/surveys/
+outputs/runs/
+outputs/datasets/
+outputs/prompts/
+experiments/runs/
+experiments/artifacts/
+
+# Model caches
+.cache/
+~/.cache/huggingface/
+hf_cache/

@@ -1,0 +1,13 @@
+output_root: outputs
+run_name: opd-distill
+seed: 42
+batch_size: 2
+grad_accum_steps: 4
+max_train_steps: 60
+learning_rate: 0.0005
+weight_decay: 0.0001
+mixed_precision: false
+max_grad_norm: 1.0
+log_every: 1
+save_every: 20
+num_workers: 0

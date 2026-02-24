@@ -1,0 +1,8 @@
+heldout_categories:
+  - fashion
+  - food
+  - travel
+  - tech
+num_eval_prompts: 24
+compute_clip_metrics: false
+export_num_pairs: 24
