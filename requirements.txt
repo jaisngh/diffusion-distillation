@@ -1,4 +1,9 @@
 numpy>=1.26
 PyYAML>=6.0
 torch>=2.2
+diffusers>=0.35
+accelerate>=1.0
+transformers>=4.46
+safetensors>=0.4
+pillow>=10.0
 pytest>=8.0
