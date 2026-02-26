@@ -1,9 +1,10 @@
 # On-Policy Distillation for Diffusion Models (CS234)
 
-This repository contains an end-to-end scaffold for on-policy distillation (OPD) of diffusion models with a two-stage path:
+This repository contains an end-to-end scaffold for on-policy distillation (OPD) of diffusion models with three hardware-targeted run configs:
 
 - `pilot`: mock teacher/student backend for fast validation and smoke tests.
-- `final`: SD3.5 Large -> SD3.5 Medium configuration wiring for full-scale runs.
+- `cuda`: SD3.5 Medium -> SD3 Medium (`diffusers`) for a single CUDA GPU.
+- `apple`: local-model Apple Silicon quick config using `mps`.
 
 ## Quickstart
 
@@ -36,16 +37,40 @@ This repository contains an end-to-end scaffold for on-policy distillation (OPD)
    python scripts/export_qualtrics.py --config configs/pilot_run.yaml
    ```
 
-## Stage Switch
+## Config Profiles
 
-- Pilot stage (default):
+- Lightweight CPU local (default):
   ```bash
-  python scripts/run_distill.py --config configs/pilot_run.yaml --stage pilot
+  python scripts/run_distill.py --config configs/pilot_run.yaml
   ```
-- Final stage:
+- Single CUDA GPU:
   ```bash
-  python scripts/run_distill.py --config configs/pilot_run.yaml --stage final
+  python scripts/run_distill.py --config configs/sd35m_sd3m_run.yaml
   ```
+- Apple Silicon (MPS) quick:
+  ```bash
+  python scripts/run_distill.py --config configs/sd35m_sd3m_m1_local_quick_run.yaml
+  ```
+
+## Stable Diffusion setup
+
+The CUDA config loads:
+
+- Teacher: `stabilityai/stable-diffusion-3.5-medium`
+- Student: `stabilityai/stable-diffusion-3-medium-diffusers`
+
+Recommended before first run:
+
+```bash
+uv venv --python 3.13 .venv
+uv pip install -r requirements.txt --python .venv/bin/python
+```
+
+If model access is gated, authenticate first:
+
+```bash
+huggingface-cli login
+```
 
 ## Outputs
 
@@ -58,5 +83,6 @@ This repository contains an end-to-end scaffold for on-policy distillation (OPD)
 
 ## Notes
 
-- The `diffusers` backend is declared for the SD3.5 stage but not yet implemented in this scaffold.
-- The pilot path is fully runnable with local mock models and is used by tests.
+- `diffusers` backend is implemented for SD3.5 teacher/student rollouts.
+- The pilot path remains the fast local path for smoke tests and CI.
+- Device selection is automatic: CUDA is used when available, otherwise Apple Silicon uses `mps`, otherwise CPU.

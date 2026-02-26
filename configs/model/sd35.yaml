@@ -1,9 +1,0 @@
-backend: diffusers
-teacher_model_id: "stabilityai/stable-diffusion-3.5-large"
-student_model_id: "stabilityai/stable-diffusion-3.5-medium"
-latent_dim: 16
-text_embed_dim: 2048
-num_inference_steps: 28
-scheduler_step_size: 0.08
-guidance_scale: 4.5
-dtype: float16

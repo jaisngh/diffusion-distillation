@@ -7,7 +7,7 @@ import torch
 
 @dataclass
 class TrajectoryStep:
-    timestep: int
+    timestep: float
     latent: torch.Tensor
     student_mean: torch.Tensor
     student_logvar: torch.Tensor

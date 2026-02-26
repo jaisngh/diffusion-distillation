@@ -2,9 +2,9 @@ experiment_name: opd-cs234
 stage: final
 seed: 42
 output_root: outputs
-model_config: model/sd35.yaml
-train_config: train/single_gpu.yaml
-distill_config: distill/kl_per_timestep.yaml
+model_config: model/sd35m_sd3m.yaml
+train_config: train/sd35m_sd3m_single_gpu.yaml
+distill_config: distill/sd35_kl.yaml
 eval_config: eval/qualtrics.yaml
 prompt_file: outputs/prompts/prompts.jsonl
 teacher_dataset_manifest: outputs/datasets/teacher_manifest.json

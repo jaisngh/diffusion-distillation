@@ -23,7 +23,7 @@ def test_rollout_shapes_and_timestep_alignment() -> None:
 
     trajectory = engine.rollout(["prompt one", "prompt two"], device=torch.device("cpu"), seed=7)
     assert len(trajectory.steps) == 8
-    assert [step.timestep for step in trajectory.steps] == list(range(7, -1, -1))
+    assert [step.timestep for step in trajectory.steps] == [float(i) for i in range(7, -1, -1)]
     assert trajectory.final_latent.shape == (2, 16)
     for step in trajectory.steps:
         assert step.student_mean.shape == step.teacher_mean.shape == (2, 16)

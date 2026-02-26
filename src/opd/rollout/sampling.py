@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -22,29 +23,33 @@ class RolloutEngine:
         device: torch.device,
         seed: int | None = None,
     ) -> TrajectoryBatch:
-        if seed is not None:
-            generator = torch.Generator(device=device)
-            generator.manual_seed(seed)
-            latent = torch.randn(
-                len(prompt_batch),
-                self.student.latent_dim,
-                device=device,
-                generator=generator,
-            )
-        else:
-            latent = torch.randn(len(prompt_batch), self.student.latent_dim, device=device)
-        latent = latent * self.initial_noise_scale
+        latent = self.student.prepare_initial_latents(
+            batch_size=len(prompt_batch),
+            device=device,
+            seed=seed,
+            scale=self.initial_noise_scale,
+        )
 
         embeddings = self.student.encode_prompts(prompt_batch, device=device)
+        timesteps: list[Any]
+        if self.student.config.backend == "diffusers":
+            timesteps = self.student.get_rollout_timesteps(self.scheduler.num_inference_steps, device=device)
+        else:
+            timesteps = self.scheduler.timesteps
+
         steps: list[TrajectoryStep] = []
-        for timestep in self.scheduler.timesteps:
+        for timestep in timesteps:
             with torch.no_grad():
                 teacher_pred = self.teacher.predict(latent, timestep, embeddings)
             student_pred = self.student.predict(latent, timestep, embeddings)
+            if isinstance(timestep, torch.Tensor):
+                step_value = float(timestep.detach().cpu().item())
+            else:
+                step_value = float(timestep)
 
             steps.append(
                 TrajectoryStep(
-                    timestep=timestep,
+                    timestep=step_value,
                     latent=latent,
                     student_mean=student_pred.mean,
                     student_logvar=student_pred.logvar,
@@ -54,6 +59,11 @@ class RolloutEngine:
                     teacher_epsilon=teacher_pred.epsilon,
                 )
             )
-            latent = self.scheduler.step(latent, student_pred.epsilon)
+            latent = self.student.step_latents(
+                latents=latent,
+                epsilon=student_pred.epsilon,
+                timestep=timestep,
+                fallback_step_size=self.scheduler.step_size,
+            )
 
         return TrajectoryBatch(prompts=prompt_batch, steps=steps, final_latent=latent)

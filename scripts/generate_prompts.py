@@ -12,7 +12,6 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from opd.data.prompt_gen import CATEGORY_TEMPLATES, generate_prompt_records, save_prompts_jsonl
 from opd.utils.io import ensure_output_layout, load_app_config, save_json
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate synthetic prompts for OPD.")
     parser.add_argument("--config", required=True, help="Path to top-level run config YAML.")

@@ -22,6 +22,17 @@ class ModelConfig:
     scheduler_step_size: float = 0.1
     guidance_scale: float = 1.0
     dtype: str = "float32"
+    revision: str | None = None
+    variant: str | None = None
+    cache_dir: str | None = None
+    local_files_only: bool = False
+    use_safetensors: bool = True
+    low_cpu_mem_usage: bool = True
+    image_height: int = 512
+    image_width: int = 512
+    max_sequence_length: int = 256
+    freeze_text_encoders: bool = True
+    freeze_vae: bool = True
 
 
 @dataclass

@@ -6,4 +6,5 @@ accelerate>=1.0
 transformers>=4.46
 safetensors>=0.4
 pillow>=10.0
+sentencepiece>=0.2
 pytest>=8.0

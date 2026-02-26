@@ -52,6 +52,7 @@ def main() -> None:
     manifest_rows: list[dict[str, object]] = []
 
     for record in prompt_dataset.records:
+        print(f"starting rollout for prompt: ", record.prompt)
         trajectory = engine.rollout([record.prompt], device=device, seed=record.seed)
         latent_path = latent_dir / f"{record.prompt_id}.pt"
         torch.save({"final_latent": trajectory.final_latent.detach().cpu()}, latent_path)
@@ -64,7 +65,7 @@ def main() -> None:
                 "image_path": str(paths["images"] / "teacher" / f"{record.prompt_id}.png"),
             }
         )
-
+        print(f"finished rollout for prompt: ", record.prompt)
     manifest_payload = {
         "teacher_model_id": config.model.teacher_model_id,
         "config_hash": config.config_hash,
@@ -73,6 +74,7 @@ def main() -> None:
     }
     save_json(config.teacher_dataset_manifest, manifest_payload)
     print(json.dumps({"manifest": config.teacher_dataset_manifest, "num_samples": len(manifest_rows)}, indent=2))
+    
 
 
 if __name__ == "__main__":

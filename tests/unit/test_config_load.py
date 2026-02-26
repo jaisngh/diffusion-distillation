@@ -13,7 +13,7 @@ def test_load_app_config_defaults() -> None:
     assert cfg.git_commit
 
 
-def test_stage_override_changes_model_config() -> None:
-    cfg = load_app_config(str(Path("configs/pilot_run.yaml")), stage_override="final")
+def test_cuda_config_uses_diffusers_backend() -> None:
+    cfg = load_app_config(str(Path("configs/sd35m_sd3m_run.yaml")))
     assert cfg.stage == "final"
     assert cfg.model.backend == "diffusers"

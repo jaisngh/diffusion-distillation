@@ -8,7 +8,3 @@ distill_config: distill/kl_per_timestep.yaml
 eval_config: eval/quant.yaml
 prompt_file: outputs/prompts/prompts.jsonl
 teacher_dataset_manifest: outputs/datasets/teacher_manifest.json
-stages:
-  final:
-    model_config: model/sd35.yaml
-    eval_config: eval/qualtrics.yaml
