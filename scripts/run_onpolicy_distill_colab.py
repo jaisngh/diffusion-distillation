@@ -114,6 +114,7 @@ COLAB_MODEL_CACHE = Path("/content/hf_models")  # Cache dir used by PREFETCH_MOD
 
 
 def _resolve_dtype(dtype_name: str) -> torch.dtype:
+    """Map a string dtype name to a torch dtype object."""
     mapping: dict[str, torch.dtype] = {
         "float16": torch.float16,
         "fp16": torch.float16,
@@ -129,12 +130,14 @@ def _resolve_dtype(dtype_name: str) -> torch.dtype:
 
 
 def set_seed(seed: int) -> None:
+    """Seed Python and Torch RNGs for reproducible runs."""
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
 def _colab_setup_commands() -> list[str]:
+    """Return setup commands to run in a fresh Colab runtime."""
     return [
         "python -m pip install -U diffusers transformers accelerate safetensors sentencepiece huggingface_hub",
         "huggingface-cli login",
@@ -144,17 +147,20 @@ def _colab_setup_commands() -> list[str]:
 
 
 def print_colab_setup_commands() -> None:
+    """Print setup commands without executing them."""
     print("# Run these in Colab before training:")
     for command in _colab_setup_commands():
         print(command)
 
 
 def _run_shell(command: str) -> None:
+    """Execute a shell command and fail on non-zero exit."""
     print(f"[bootstrap] {command}")
     subprocess.run(command, shell=True, check=True)
 
 
 def maybe_bootstrap_colab(install_deps: bool, prefetch_models: bool) -> None:
+    """Optionally install dependencies and prefetch model weights."""
     if install_deps:
         _run_shell(
             f"{sys.executable} -m pip install -U diffusers transformers accelerate "
@@ -185,6 +191,7 @@ def dep_install() -> None:
 
 @dataclass
 class PromptRecord:
+    """One prompt row used by training."""
     prompt_id: str
     prompt: str
     category: str
@@ -192,11 +199,15 @@ class PromptRecord:
 
 
 class PromptDataset:
+    """Container for prompt records loaded from JSONL."""
+
     def __init__(self, records: list[PromptRecord]) -> None:
+        """Initialize dataset with already-parsed records."""
         self.records = records
 
     @classmethod
     def from_jsonl(cls, path: str | Path) -> "PromptDataset":
+        """Load prompt records from a JSONL file."""
         target = Path(path)
         records: list[PromptRecord] = []
         with target.open("r", encoding="utf-8") as handle:
@@ -216,10 +227,12 @@ class PromptDataset:
         return cls(records)
 
     def __len__(self) -> int:
+        """Return number of prompt records."""
         return len(self.records)
 
 
 def _prompt_id(category: str, prompt: str, seed: int) -> str:
+    """Create a stable short id for a prompt/category/seed triple."""
     digest = hashlib.sha1(f"{category}|{prompt}|{seed}".encode("utf-8")).hexdigest()
     return digest[:16]
 
@@ -229,6 +242,7 @@ def generate_prompt_records(
     seed: int,
     categories: list[str],
 ) -> list[dict[str, object]]:
+    """Generate synthetic prompt rows from category templates."""
     rng = random.Random(seed)
     records: list[dict[str, object]] = []
     for category in categories:
@@ -257,6 +271,7 @@ def generate_prompt_records(
 
 
 def save_prompts_jsonl(path: str | Path, records: list[dict[str, object]]) -> None:
+    """Write generated prompt rows to JSONL."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("w", encoding="utf-8") as handle:
@@ -288,6 +303,7 @@ def maybe_generate_prompts(path: Path) -> None:
 
 
 def iter_prompt_batches(dataset: PromptDataset, batch_size: int, seed: int) -> list[list[PromptRecord]]:
+    """Shuffle records deterministically and split into fixed-size batches."""
     indices = list(range(len(dataset)))
     rng = random.Random(seed)
     rng.shuffle(indices)
@@ -299,7 +315,10 @@ def iter_prompt_batches(dataset: PromptDataset, batch_size: int, seed: int) -> l
 
 
 class CsvMetricWriter:
+    """Simple append-only CSV metric logger."""
+
     def __init__(self, path: Path, fieldnames: list[str]) -> None:
+        """Create metric file and header if missing."""
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.fieldnames = fieldnames
@@ -309,23 +328,31 @@ class CsvMetricWriter:
                 writer.writeheader()
 
     def write(self, payload: dict[str, float]) -> None:
+        """Append one metrics row to CSV."""
         with self.path.open("a", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=self.fieldnames)
             writer.writerow({name: payload.get(name) for name in self.fieldnames})
 
 
 class JsonlMetricWriter:
+    """Simple append-only JSONL metric logger."""
+
     def __init__(self, path: Path) -> None:
+        """Ensure output directory exists for JSONL metrics."""
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def write(self, payload: dict[str, float]) -> None:
+        """Append one JSON metrics object per line."""
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
 class DiffusionModelWrapper(nn.Module):
+    """Thin wrapper around SD3 pipeline used for teacher/student roles."""
+
     def __init__(self, model_id: str, role: str) -> None:
+        """Load pipeline and set trainable parameters by role."""
         super().__init__()
         self.role = role
         try:
@@ -360,6 +387,7 @@ class DiffusionModelWrapper(nn.Module):
             param.requires_grad = train_transformer
 
     def encode_prompts(self, prompts: list[str], device: torch.device) -> dict[str, torch.Tensor]:
+        """Encode string prompts into SD3 conditioning embeddings."""
         with torch.no_grad():
             prompt_embeds, _, pooled_prompt_embeds, _ = self.pipeline.encode_prompt(
                 prompt=prompts,
@@ -378,6 +406,7 @@ class DiffusionModelWrapper(nn.Module):
         seed: int | None,
         device: torch.device,
     ) -> torch.Tensor:
+        """Sample initial latent noise for rollout starts."""
         generator = None
         if seed is not None:
             generator = torch.Generator(device=device)
@@ -394,6 +423,7 @@ class DiffusionModelWrapper(nn.Module):
         ) * INITIAL_NOISE_SCALE
 
     def get_timesteps(self, device: torch.device) -> list[Any]:
+        """Prepare scheduler timesteps for the current rollout horizon."""
         self.pipeline.scheduler.set_timesteps(NUM_INFERENCE_STEPS, device=device)
         return list(self.pipeline.scheduler.timesteps)
 
@@ -404,6 +434,7 @@ class DiffusionModelWrapper(nn.Module):
         prompt_embeds: torch.Tensor,
         pooled_prompt_embeds: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Predict mean/logvar/epsilon at one denoising step."""
         model_dtype = next(self.pipeline.transformer.parameters()).dtype
         latent_input = latents.to(dtype=model_dtype)
         prompt_embeds = prompt_embeds.to(device=latents.device, dtype=model_dtype)
@@ -427,6 +458,7 @@ class DiffusionModelWrapper(nn.Module):
         return mean, logvar, epsilon
 
     def step_latents(self, latents: torch.Tensor, epsilon: torch.Tensor, timestep: Any) -> torch.Tensor:
+        """Advance latents by one scheduler step using epsilon prediction."""
         return self.pipeline.scheduler.step(
             model_output=epsilon.to(latents.dtype),
             timestep=timestep,
@@ -436,12 +468,14 @@ class DiffusionModelWrapper(nn.Module):
 
 
 def gaussian_kl(mean_q: torch.Tensor, logvar_q: torch.Tensor, mean_p: torch.Tensor, logvar_p: torch.Tensor) -> torch.Tensor:
+    """Compute per-dimension KL divergence between two diagonal Gaussians."""
     var_q = torch.exp(logvar_q)
     var_p = torch.exp(logvar_p)
     return 0.5 * (logvar_p - logvar_q + (var_q + (mean_q - mean_p).pow(2)) / var_p - 1.0)
 
 
 def save_checkpoint(path: Path, student: DiffusionModelWrapper, optimizer: torch.optim.Optimizer, step: int) -> None:
+    """Persist student transformer weights plus optimizer state."""
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -455,6 +489,7 @@ def save_checkpoint(path: Path, student: DiffusionModelWrapper, optimizer: torch
 
 
 def _config_hash() -> str:
+    """Create a short reproducibility hash from key config values."""
     payload = {
         "experiment_name": EXPERIMENT_NAME,
         "stage": STAGE,
@@ -468,6 +503,7 @@ def _config_hash() -> str:
 
 
 def main() -> None:
+    """Run full pipeline: optional setup, prompts, then on-policy distillation."""
     # Optional one-time setup for fresh Colab runtimes.
     # Uncomment, run once, then comment back out to avoid re-installs.
     # dep_install()
@@ -477,6 +513,9 @@ def main() -> None:
 
     # -----------------------------------------------------------------------
     # Phase 1: Prompt generation/loading
+    # - Optionally generate a prompt file.
+    # - Verify the prompt file exists.
+    # - Load prompt records for training.
     # -----------------------------------------------------------------------
     prompts_path = Path(PROMPTS_JSONL)
     maybe_generate_prompts(prompts_path)
@@ -503,6 +542,9 @@ def main() -> None:
 
     # -----------------------------------------------------------------------
     # Phase 2: On-policy teacher-student distillation
+    # - Initialize teacher (frozen) and student (trainable transformer).
+    # - For each step: rollout on student states, supervise with teacher.
+    # - Optimize weighted KL + epsilon MSE + latent MSE objective.
     # -----------------------------------------------------------------------
     teacher = DiffusionModelWrapper(TEACHER_MODEL_ID, role="teacher").to(device)
     student = DiffusionModelWrapper(STUDENT_MODEL_ID, role="student").to(device)
@@ -536,6 +578,7 @@ def main() -> None:
     global_step = 0
     optimizer.zero_grad(set_to_none=True)
     while global_step < MAX_TRAIN_STEPS:
+        # Select batch deterministically and update the per-step noise seed.
         batch = batches[global_step % len(batches)]
         prompts = [row.prompt for row in batch]
         step_seed = SEED + global_step
@@ -588,6 +631,7 @@ def main() -> None:
             if final_student_mean is None or final_teacher_mean is None:
                 raise RuntimeError("No timesteps were produced by scheduler.")
 
+            # Loss terms are averaged over rollout steps, then combined by weights.
             kl_loss = torch.stack(kl_terms).mean()
             epsilon_mse_loss = torch.stack(eps_terms).mean()
             latent_mse_loss = F.mse_loss(final_student_mean, final_teacher_mean)
@@ -602,6 +646,7 @@ def main() -> None:
                 + EPSILON_MSE_WEIGHT * epsilon_mse_loss
                 + LATENT_MSE_WEIGHT * latent_mse_loss
             )
+            # Gradient accumulation keeps effective batch larger on limited VRAM.
             loss = total / GRAD_ACCUM_STEPS
 
         scaler.scale(loss).backward()
