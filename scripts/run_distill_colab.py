@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
 import csv
 import json
 import random
@@ -63,25 +62,10 @@ TEACHER_ROLLOUT_DIR = "/content/path/to/teacher_rollouts"
 # Optional local cache for explicit CLI prefetch downloads.
 COLAB_MODEL_CACHE = Path("/content/hf_models")
 
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Self-contained SD3 distillation script for Colab/CUDA.")
-    parser.add_argument(
-        "--print-colab-setup",
-        action="store_true",
-        help="Print shell commands to install dependencies and download HF models in Colab.",
-    )
-    parser.add_argument(
-        "--install-deps",
-        action="store_true",
-        help="Run pip install commands from inside this script before training.",
-    )
-    parser.add_argument(
-        "--prefetch-models",
-        action="store_true",
-        help="Run huggingface-cli download for teacher and student model ids before training.",
-    )
-    return parser.parse_args()
+# Optional one-click bootstrap toggles (kept hard-coded instead of CLI args).
+PRINT_COLAB_SETUP = False
+INSTALL_DEPS = False
+PREFETCH_MODELS = False
 
 
 def _colab_setup_commands() -> list[str]:
@@ -339,14 +323,13 @@ def save_checkpoint(path: Path, model: StudentDiffusionModel, optimizer: torch.o
 
 
 def main() -> None:
-    args = parse_args()
-    if args.print_colab_setup:
+    if PRINT_COLAB_SETUP:
         print_colab_setup_commands()
         return
 
     maybe_bootstrap_colab(
-        install_deps=args.install_deps,
-        prefetch_models=args.prefetch_models,
+        install_deps=INSTALL_DEPS,
+        prefetch_models=PREFETCH_MODELS,
     )
 
     if not torch.cuda.is_available():
