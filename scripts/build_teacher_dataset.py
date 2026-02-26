@@ -35,6 +35,7 @@ def main() -> None:
 
     prompt_dataset = PromptDataset.from_jsonl(config.prompt_file)
     device = select_device(prefer_cuda=False)
+    print(f"Using device: {device}")
     teacher = build_teacher_model(config.model).to(device)
     scheduler = LinearTimeScheduler(
         num_inference_steps=config.distill.num_inference_steps,

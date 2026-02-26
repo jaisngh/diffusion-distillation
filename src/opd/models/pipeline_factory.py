@@ -75,6 +75,18 @@ class DiffusionModelWrapper(nn.Module):
             raise ValueError(f"Unsupported dtype '{dtype_name}'.")
         return mapping[key]
 
+    @staticmethod
+    def _prefer_fp16_on_mps(dtype: torch.dtype) -> torch.dtype:
+        mps_backend = getattr(torch.backends, "mps", None)
+        mps_is_available = bool(
+            mps_backend is not None
+            and callable(getattr(mps_backend, "is_available", None))
+            and mps_backend.is_available()
+        )
+        if mps_is_available and dtype == torch.float32:
+            return torch.float16
+        return dtype
+
     def _build_diffusers_backbone(self) -> nn.Module:
         try:
             from diffusers import StableDiffusion3Pipeline
@@ -85,7 +97,7 @@ class DiffusionModelWrapper(nn.Module):
             ) from exc
 
         model_id = self._resolve_model_id()
-        torch_dtype = self._resolve_dtype(self.config.dtype)
+        torch_dtype = self._prefer_fp16_on_mps(self._resolve_dtype(self.config.dtype))
         pipeline = StableDiffusion3Pipeline.from_pretrained(
             model_id,
             torch_dtype=torch_dtype,
