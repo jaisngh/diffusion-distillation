@@ -13,6 +13,7 @@ import csv
 import hashlib
 import json
 import random
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -37,8 +38,9 @@ RUN_NAME = "opd-distill-sd35m-sd3m-onpolicy-colab"
 # Model setup (configs/model/sd35m_sd3m.yaml)
 TEACHER_MODEL_ID = "stabilityai/stable-diffusion-3.5-medium"  # Teacher checkpoint from HF Hub.
 STUDENT_MODEL_ID = "stabilityai/stable-diffusion-3-medium-diffusers"  # Student checkpoint from HF Hub.
-DTYPE_NAME = "float16"  # Runtime dtype for both models.
-NUM_INFERENCE_STEPS = 12  # Number of denoising steps in each rollout.
+DTYPE_NAME = "bfloat16"  # Runtime dtype for model weights.
+TRAIN_NUM_INFERENCE_STEPS = 12  # Number of denoising steps during training rollouts.
+EVAL_NUM_INFERENCE_STEPS = 24  # Number of denoising steps when generating eval images.
 SCHEDULER_STEP_SIZE = 0.1  # Kept for config parity; scheduler uses its own internal stepping.
 IMAGE_HEIGHT = 512  # Latent/image height used when sampling.
 IMAGE_WIDTH = 512  # Latent/image width used when sampling.
@@ -56,12 +58,19 @@ CACHE_DIR: str | None = None  # Optional custom cache directory.
 BATCH_SIZE = 1  # Prompts per optimization micro-step.
 GRAD_ACCUM_STEPS = 8  # Micro-steps to accumulate before optimizer.step().
 MAX_TRAIN_STEPS = 40  # Total micro-steps to run.
-LEARNING_RATE = 1e-4  # AdamW learning rate.
+LEARNING_RATE = 1e-5  # AdamW learning rate (lowered for SD3 stability).
 WEIGHT_DECAY = 1e-4  # AdamW weight decay.
-MIXED_PRECISION = True  # Enable AMP autocast + grad scaling on CUDA.
-MAX_GRAD_NORM = 1.0  # Gradient clipping threshold.
+MIXED_PRECISION = True  # Use autocast for bf16/fp16 kernels; often more stable than plain low-precision.
 LOG_EVERY = 1  # Metric logging interval (steps).
 SAVE_EVERY = 10  # Checkpoint save interval (steps).
+EVAL_OUTPUT_DIR = OUTPUT_ROOT / "eval_images" / RUN_NAME  # Directory for post-train qualitative samples.
+EVAL_PROMPTS = [
+    "A cozy coffee shop interior at golden hour, cinematic photo style",
+    "A futuristic electric sports car driving through a neon city at night",
+    "A vibrant fruit tart on a marble table, studio food photography",
+    "A hiker standing on a snowy mountain ridge under dramatic clouds",
+    "A minimal product ad for wireless earbuds with clean typography backdrop",
+]  # Held-out prompts for qualitative teacher/student comparisons.
 
 # Distill setup (configs/distill/sd35_kl.yaml)
 INITIAL_NOISE_SCALE = 1.0  # Scale applied to initial sampled latents.
@@ -210,6 +219,7 @@ class PromptDataset:
         """Load prompt records from a JSONL file."""
         target = Path(path)
         records: list[PromptRecord] = []
+        # Each line is a JSON object with prompt_id/prompt/category/seed.
         with target.open("r", encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
@@ -322,6 +332,7 @@ class CsvMetricWriter:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.fieldnames = fieldnames
+        # Create the file with header exactly once.
         if not self.path.exists():
             with self.path.open("w", encoding="utf-8", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=self.fieldnames)
@@ -344,6 +355,7 @@ class JsonlMetricWriter:
 
     def write(self, payload: dict[str, float]) -> None:
         """Append one JSON metrics object per line."""
+        # JSONL makes it easy to stream metrics during long runs.
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
@@ -370,8 +382,12 @@ class DiffusionModelWrapper(nn.Module):
             use_safetensors=USE_SAFETENSORS,
             low_cpu_mem_usage=LOW_CPU_MEM_USAGE,
         )
+        # Register the trainable UNet/transformer on this module so
+        # .parameters(), .train(), and .eval() recurse as expected.
+        self.transformer = self.pipeline.transformer
 
         if FREEZE_TEXT_ENCODERS:
+            # Text encoders are used for conditioning but not updated during distillation.
             for encoder_name in ("text_encoder", "text_encoder_2", "text_encoder_3"):
                 encoder = getattr(self.pipeline, encoder_name, None)
                 if encoder is None:
@@ -379,16 +395,23 @@ class DiffusionModelWrapper(nn.Module):
                 for param in encoder.parameters():
                     param.requires_grad = False
         if FREEZE_VAE and getattr(self.pipeline, "vae", None) is not None:
+            # VAE is not part of this optimization objective.
             for param in self.pipeline.vae.parameters():
                 param.requires_grad = False
 
+        # Only student transformer should be trainable.
         train_transformer = role == "student"
-        for param in self.pipeline.transformer.parameters():
+        for param in self.transformer.parameters():
             param.requires_grad = train_transformer
 
     def encode_prompts(self, prompts: list[str], device: torch.device) -> dict[str, torch.Tensor]:
         """Encode string prompts into SD3 conditioning embeddings."""
-        with torch.no_grad():
+        for encoder_name in ("text_encoder", "text_encoder_2", "text_encoder_3"):
+            encoder = getattr(self.pipeline, encoder_name, None)
+            if encoder is not None:
+                encoder.to(device=device, dtype=torch.float32)
+        # Prompt encoding is inference-only for both teacher and student.
+        with torch.no_grad(), autocast("cuda", enabled=False):
             prompt_embeds, _, pooled_prompt_embeds, _ = self.pipeline.encode_prompt(
                 prompt=prompts,
                 prompt_2=prompts,
@@ -398,6 +421,8 @@ class DiffusionModelWrapper(nn.Module):
                 do_classifier_free_guidance=False,
                 max_sequence_length=MAX_SEQUENCE_LENGTH,
             )
+        prompt_embeds = prompt_embeds.to(dtype=torch.float32)
+        pooled_prompt_embeds = pooled_prompt_embeds.to(dtype=torch.float32)
         return {"prompt_embeds": prompt_embeds, "pooled_prompt_embeds": pooled_prompt_embeds}
 
     def prepare_initial_latents(
@@ -409,22 +434,24 @@ class DiffusionModelWrapper(nn.Module):
         """Sample initial latent noise for rollout starts."""
         generator = None
         if seed is not None:
+            # Deterministic seed keeps training reproducible between runs.
             generator = torch.Generator(device=device)
             generator.manual_seed(seed)
         return self.pipeline.prepare_latents(
             batch_size=batch_size,
-            num_channels_latents=self.pipeline.transformer.config.in_channels,
+            num_channels_latents=self.transformer.config.in_channels,
             height=IMAGE_HEIGHT,
             width=IMAGE_WIDTH,
-            dtype=_resolve_dtype(DTYPE_NAME),
+            # Keep scheduler state in fp32 to reduce NaNs during iterative updates.
+            dtype=torch.float32,
             device=device,
             generator=generator,
             latents=None,
         ) * INITIAL_NOISE_SCALE
 
-    def get_timesteps(self, device: torch.device) -> list[Any]:
+    def get_timesteps(self, num_inference_steps: int, device: torch.device) -> list[Any]:
         """Prepare scheduler timesteps for the current rollout horizon."""
-        self.pipeline.scheduler.set_timesteps(NUM_INFERENCE_STEPS, device=device)
+        self.pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
         return list(self.pipeline.scheduler.timesteps)
 
     def predict(
@@ -435,17 +462,19 @@ class DiffusionModelWrapper(nn.Module):
         pooled_prompt_embeds: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Predict mean/logvar/epsilon at one denoising step."""
-        model_dtype = next(self.pipeline.transformer.parameters()).dtype
-        latent_input = latents.to(dtype=model_dtype)
+        # Cast inputs to transformer dtype for stable mixed-precision execution.
+        model_dtype = next(self.transformer.parameters()).dtype
+        latent_input = self.pipeline.scheduler.scale_model_input(latents, timestep).to(dtype=model_dtype)
         prompt_embeds = prompt_embeds.to(device=latents.device, dtype=model_dtype)
         pooled_prompt_embeds = pooled_prompt_embeds.to(device=latents.device, dtype=model_dtype)
         if isinstance(timestep, torch.Tensor):
-            timestep_tensor = timestep.to(device=latents.device, dtype=model_dtype)
+            # Timestep conditioning is numerically safer in fp32.
+            timestep_tensor = timestep.to(device=latents.device, dtype=torch.float32)
         else:
-            timestep_tensor = torch.tensor(timestep, device=latents.device, dtype=model_dtype)
+            timestep_tensor = torch.tensor(timestep, device=latents.device, dtype=torch.float32)
         timestep_tensor = timestep_tensor.expand(latent_input.shape[0])
 
-        epsilon = self.pipeline.transformer(
+        epsilon = self.transformer(
             hidden_states=latent_input,
             timestep=timestep_tensor,
             encoder_hidden_states=prompt_embeds,
@@ -453,6 +482,7 @@ class DiffusionModelWrapper(nn.Module):
             return_dict=False,
         )[0]
         epsilon = epsilon.to(dtype=latents.dtype)
+        # Keep variance fixed to zero in this simplified Gaussian parameterization.
         logvar = torch.zeros_like(epsilon)
         mean = latents - epsilon
         return mean, logvar, epsilon
@@ -479,7 +509,7 @@ def save_checkpoint(path: Path, student: DiffusionModelWrapper, optimizer: torch
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "student_transformer": student.pipeline.transformer.state_dict(),
+            "student_transformer": student.transformer.state_dict(),
             "optimizer": optimizer.state_dict(),
             "step": step,
             "run_name": RUN_NAME,
@@ -496,10 +526,63 @@ def _config_hash() -> str:
         "teacher_model_id": TEACHER_MODEL_ID,
         "student_model_id": STUDENT_MODEL_ID,
         "dtype": DTYPE_NAME,
-        "num_inference_steps": NUM_INFERENCE_STEPS,
+        "train_num_inference_steps": TRAIN_NUM_INFERENCE_STEPS,
+        "eval_num_inference_steps": EVAL_NUM_INFERENCE_STEPS,
         "train_steps": MAX_TRAIN_STEPS,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _slugify(text: str) -> str:
+    """Convert prompt text into a short filesystem-safe slug."""
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", text.strip().lower()).strip("_")
+    if not cleaned:
+        return "prompt"
+    return cleaned[:60]
+
+
+def _save_eval_images(
+    *,
+    model: DiffusionModelWrapper,
+    model_name: str,
+    prompts: list[str],
+    output_dir: Path,
+    seed_base: int,
+    num_inference_steps: int,
+    device: torch.device,
+) -> None:
+    """Generate and save one image per prompt for a specific model."""
+    model.eval()
+    model.pipeline.to(device)
+    model_dir = output_dir / model_name
+    model_dir.mkdir(parents=True, exist_ok=True)
+    with torch.inference_mode():
+        for prompt_idx, prompt in enumerate(prompts):
+            prompt_seed = seed_base + prompt_idx
+            generator = torch.Generator(device=device).manual_seed(prompt_seed)
+            result = model.pipeline(
+                prompt=prompt,
+                prompt_2=prompt,
+                prompt_3=prompt,
+                num_inference_steps=num_inference_steps,
+                height=IMAGE_HEIGHT,
+                width=IMAGE_WIDTH,
+                generator=generator,
+            )
+            image = result.images[0]
+            image_name = f"{prompt_idx:02d}_{_slugify(prompt)}.png"
+            image.save(model_dir / image_name)
+
+    manifest = {
+        "model": model_name,
+        "seed_base": seed_base,
+        "num_inference_steps": num_inference_steps,
+        "height": IMAGE_HEIGHT,
+        "width": IMAGE_WIDTH,
+        "prompts": prompts,
+    }
+    with (model_dir / "manifest.json").open("w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
 
 
 def main() -> None:
@@ -548,14 +631,22 @@ def main() -> None:
     # -----------------------------------------------------------------------
     teacher = DiffusionModelWrapper(TEACHER_MODEL_ID, role="teacher").to(device)
     student = DiffusionModelWrapper(STUDENT_MODEL_ID, role="student").to(device)
+    # Move full pipelines so text encoders/scheduler buffers match CUDA tensors.
+    teacher.pipeline.to(device)
+    student.pipeline.to(device)
     teacher.eval()
+    student.train()
 
     optimizer = torch.optim.AdamW(
         (param for param in student.parameters() if param.requires_grad),
         lr=LEARNING_RATE,
         weight_decay=WEIGHT_DECAY,
     )
-    scaler = GradScaler("cuda", enabled=MIXED_PRECISION)
+    model_dtype = _resolve_dtype(DTYPE_NAME)
+    use_autocast = MIXED_PRECISION and model_dtype in (torch.float16, torch.bfloat16)
+    # GradScaler is only supported/needed for fp16 (not bf16).
+    use_grad_scaler = MIXED_PRECISION and model_dtype == torch.float16
+    scaler = GradScaler("cuda", enabled=use_grad_scaler)
 
     metrics_jsonl = JsonlMetricWriter(metrics_dir / "metrics.jsonl")
     metrics_csv = CsvMetricWriter(
@@ -563,11 +654,9 @@ def main() -> None:
         fieldnames=[
             "step",
             "total_loss",
-            "kl_loss",
             "epsilon_mse_loss",
             "latent_mse_loss",
             "lr",
-            "grad_norm",
         ],
     )
 
@@ -583,7 +672,7 @@ def main() -> None:
         prompts = [row.prompt for row in batch]
         step_seed = SEED + global_step
 
-        with autocast("cuda", enabled=MIXED_PRECISION):
+        with autocast("cuda", dtype=model_dtype, enabled=use_autocast):
             # Student starts from noise and defines the rollout states we supervise on.
             latents = student.prepare_initial_latents(
                 batch_size=len(prompts),
@@ -591,9 +680,8 @@ def main() -> None:
                 device=device,
             )
             embeddings = student.encode_prompts(prompts, device=device)
-            timesteps = student.get_timesteps(device=device)
+            timesteps = student.get_timesteps(num_inference_steps=TRAIN_NUM_INFERENCE_STEPS, device=device)
 
-            kl_terms: list[torch.Tensor] = []
             eps_terms: list[torch.Tensor] = []
             final_student_mean: torch.Tensor | None = None
             final_teacher_mean: torch.Tensor | None = None
@@ -601,27 +689,28 @@ def main() -> None:
             for timestep in timesteps:
                 # Teacher labels the student's current latent state (on-policy supervision).
                 with torch.no_grad():
-                    teacher_mean, teacher_logvar, teacher_eps = teacher.predict(
+                    teacher_mean, _, teacher_eps = teacher.predict(
                         latents=latents,
                         timestep=timestep,
                         prompt_embeds=embeddings["prompt_embeds"],
                         pooled_prompt_embeds=embeddings["pooled_prompt_embeds"],
                     )
-                student_mean, student_logvar, student_eps = student.predict(
+                student_mean, _, student_eps = student.predict(
                     latents=latents,
                     timestep=timestep,
                     prompt_embeds=embeddings["prompt_embeds"],
                     pooled_prompt_embeds=embeddings["pooled_prompt_embeds"],
                 )
+                if not (
+                    torch.isfinite(teacher_eps).all()
+                    and torch.isfinite(student_eps).all()
+                    and torch.isfinite(latents).all()
+                ):
+                    raise RuntimeError(
+                        f"Non-finite tensor detected at global_step={global_step}, "
+                        f"timestep={timestep}. Try lower LR or disable mixed precision."
+                    )
 
-                kl_terms.append(
-                    gaussian_kl(
-                        mean_q=student_mean,
-                        logvar_q=student_logvar,
-                        mean_p=teacher_mean,
-                        logvar_p=teacher_logvar,
-                    ).mean()
-                )
                 eps_terms.append(F.mse_loss(student_eps, teacher_eps))
                 final_student_mean = student_mean
                 final_teacher_mean = teacher_mean
@@ -632,45 +721,40 @@ def main() -> None:
                 raise RuntimeError("No timesteps were produced by scheduler.")
 
             # Loss terms are averaged over rollout steps, then combined by weights.
-            kl_loss = torch.stack(kl_terms).mean()
             epsilon_mse_loss = torch.stack(eps_terms).mean()
             latent_mse_loss = F.mse_loss(final_student_mean, final_teacher_mean)
 
-            if WARMUP_STEPS > 0 and global_step < WARMUP_STEPS:
-                kl_weight = KL_WEIGHT * float(global_step + 1) / float(WARMUP_STEPS)
-            else:
-                kl_weight = KL_WEIGHT
-
             total = (
-                kl_weight * kl_loss
-                + EPSILON_MSE_WEIGHT * epsilon_mse_loss
+                EPSILON_MSE_WEIGHT * epsilon_mse_loss
                 + LATENT_MSE_WEIGHT * latent_mse_loss
             )
+            if not torch.isfinite(total):
+                raise RuntimeError(
+                    f"Non-finite total loss at global_step={global_step}. "
+                    "Try lower LR or disable mixed precision."
+                )
             # Gradient accumulation keeps effective batch larger on limited VRAM.
             loss = total / GRAD_ACCUM_STEPS
 
-        scaler.scale(loss).backward()
+        if use_grad_scaler:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
-        grad_norm = 0.0
         if (global_step + 1) % GRAD_ACCUM_STEPS == 0:
-            scaler.unscale_(optimizer)
-            grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
-                [param for param in student.parameters() if param.requires_grad],
-                MAX_GRAD_NORM,
-            )
-            grad_norm = float(grad_norm_tensor.detach().cpu().item())
-            scaler.step(optimizer)
-            scaler.update()
+            if use_grad_scaler:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
         metrics = {
             "step": float(global_step),
             "total_loss": float(total.detach().cpu().item()),
-            "kl_loss": float(kl_loss.detach().cpu().item()),
             "epsilon_mse_loss": float(epsilon_mse_loss.detach().cpu().item()),
             "latent_mse_loss": float(latent_mse_loss.detach().cpu().item()),
             "lr": float(optimizer.param_groups[0]["lr"]),
-            "grad_norm": grad_norm,
         }
         if global_step % LOG_EVERY == 0:
             print(json.dumps(metrics, sort_keys=True))
@@ -684,6 +768,66 @@ def main() -> None:
 
     final_ckpt = ckpt_dir / "final.pt"
     save_checkpoint(final_ckpt, student, optimizer, global_step)
+
+    # -----------------------------------------------------------------------
+    # Phase 3: Qualitative evaluation images
+    # - Save teacher/original-student/distilled-student outputs on held-out prompts.
+    # - Use a fixed seed schedule for comparable visual outputs per prompt.
+    # -----------------------------------------------------------------------
+    eval_dir = Path(EVAL_OUTPUT_DIR)
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    eval_prompts = list(EVAL_PROMPTS)
+    if len(eval_prompts) == 0:
+        raise RuntimeError("EVAL_PROMPTS is empty. Add at least one prompt for evaluation.")
+
+    _save_eval_images(
+        model=teacher,
+        model_name="teacher",
+        prompts=eval_prompts,
+        output_dir=eval_dir,
+        seed_base=SEED + 10_000,
+        num_inference_steps=EVAL_NUM_INFERENCE_STEPS,
+        device=device,
+    )
+    del teacher
+    torch.cuda.empty_cache()
+
+    del student
+    torch.cuda.empty_cache()
+
+    original_student = DiffusionModelWrapper(STUDENT_MODEL_ID, role="student").to(device)
+    _save_eval_images(
+        model=original_student,
+        model_name="original_student",
+        prompts=eval_prompts,
+        output_dir=eval_dir,
+        seed_base=SEED + 10_000,
+        num_inference_steps=EVAL_NUM_INFERENCE_STEPS,
+        device=device,
+    )
+    del original_student
+    torch.cuda.empty_cache()
+
+    distilled_student = DiffusionModelWrapper(STUDENT_MODEL_ID, role="student").to(device)
+    distilled_state = torch.load(final_ckpt, map_location="cpu")
+    transformer_state = (
+        distilled_state["student_transformer"]
+        if isinstance(distilled_state, dict) and "student_transformer" in distilled_state
+        else distilled_state
+    )
+    distilled_student.transformer.load_state_dict(transformer_state)
+    _save_eval_images(
+        model=distilled_student,
+        model_name="distilled_student",
+        prompts=eval_prompts,
+        output_dir=eval_dir,
+        seed_base=SEED + 10_000,
+        num_inference_steps=EVAL_NUM_INFERENCE_STEPS,
+        device=device,
+    )
+    del distilled_student
+    torch.cuda.empty_cache()
+
     summary = {
         "experiment_name": EXPERIMENT_NAME,
         "stage": STAGE,
@@ -691,8 +835,12 @@ def main() -> None:
         "config_hash": _config_hash(),
         "num_prompts": len(dataset),
         "max_train_steps": MAX_TRAIN_STEPS,
+        "train_num_inference_steps": TRAIN_NUM_INFERENCE_STEPS,
+        "eval_num_inference_steps": EVAL_NUM_INFERENCE_STEPS,
         "checkpoint": str(final_ckpt),
         "metrics_jsonl": str(metrics_dir / "metrics.jsonl"),
+        "eval_output_dir": str(eval_dir),
+        "eval_prompts": eval_prompts,
     }
     with (run_dir / "train_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True)
